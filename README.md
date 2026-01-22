@@ -13,10 +13,10 @@ Key Items:
 - The orignal code steering wheel detection based on actual speed not matching commanded speed is still in place and should funcation normally
 - This code does account for the Keya motor making multiple turns and the encoder resetting.  Need further tested.
 - The ratio from the steering motor to wheel angle is hard coded at 30 currently (30 degrees on steering motor = 1 degree on wheels).  Not right, but a starting point
-- This ignores any ADS1115 WAS signal.
+- Ser AD Convertor mode to "differential" to ignore any ADS1115 WAS signal.  On 'Single' it *should* use the WAS sensor like normal.
+- Steering ratio (motor turns to wheel angle) is set through adjusting the Counts Per Degree slider.   it takes that number and divides by 10, so 100 - means 10 degree change in the motor angle = 1 degree change at the axle for the tires.  150 would be 15 motor degrees = 1 degree of tire steer.  There is no adjustment for nonlinearities.
 
 TO DO:
 - See if there drift is an issue or if some sort of live drift compensation needs implemented
 - Detect which version of the Keya Motor is attached and adjust / work accordingly.
-- FIgure out a way to allow adjustment of the steering ratio (hard coded at 30) from the AgOpenUI.  Thinking about using the counts per degree slider.  i.e. instead of it representing counts per degree, when working in this mode, have the slider represent the steering ratio of handwheel angle to tire steering angle.
 - Add in the smart to detect if a WAS is attached and automatically us if there is one (maybe, would only make it easier / better for developing a universal code base)
