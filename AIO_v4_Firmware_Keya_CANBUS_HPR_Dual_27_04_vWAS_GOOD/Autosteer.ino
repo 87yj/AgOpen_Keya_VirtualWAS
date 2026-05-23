@@ -69,6 +69,29 @@ static bool keyaEncoderInitialized = false;
 // Tunable parameters
 float keyaDegreesPerTireDegree = 15;   // steering ratio (wheel:motor)
 
+// Tunable parameters
+float keyaDegreesPerTireDegree = 15;   // steering ratio (wheel:motor)
+
+// ========================================================
+// ENHANCED FIELD-HARDENED AUTO-TRIM FOR HYDROSTATIC SLIP
+// ========================================================
+static float dynamicEncoderTrim = 0.0f;       // Shifts over time to counter orbitrol drift
+static int32_t straightLineAccumulator = 0;   // Confidence accumulator to filter field oscillations
+static float distanceTraveledStraight = 0.0f; // Distance traveled during straight sections
+static bool isStraightLine = false;           // Hysteresis flag for straight detection
+static bool wasKeyaDetected = false;          // Track Keya connection state for reset
+
+// ===== Trim Algorithm Parameters =====
+const float MAX_STRAIGHT_YAW_ENTRY = 60.0f;   // Hysteresis entry: 0.6 deg/sec yaw threshold
+const float MAX_STRAIGHT_YAW_EXIT = 100.0f;   // Hysteresis exit: 1.0 deg/sec yaw threshold
+const float MIN_SPEED_FOR_TRIM = 3.5f;        // Minimum speed (km/h) to execute trim adjustments
+const float MIN_DISTANCE_FOR_TRIM = 50.0f;    // Minimum distance (meters) at constant speed
+const int32_t ACCUMULATOR_THRESHOLD = 500;    // Loop count for high confidence (10 sec at 50Hz)
+const float TRIM_GAIN_LOW = 0.0005f;          // Conservative gain during buildup phase
+const float TRIM_GAIN_HIGH = 0.002f;          // Aggressive gain once confidence established
+const float MAX_TRIM_LIMIT = 5.0f;            // Maximum motor angle trim (±5°)
+// ========================================================
+
 // ethernet
 #include <NativeEthernet.h>
 #include <NativeEthernetUdp.h>
@@ -476,51 +499,107 @@ void autosteerLoop()
     switchByte |= (steerSwitch << 1);   //put steerswitch status in bit 1 position
     switchByte |= workSwitch;
 
+//New code block being worked on....
 
+    // ========================================================
+    // 1. KEYA DISCONNECT DETECTION AND TRIM RESET
+    // Check this BEFORE the main steering logic split
+    // ========================================================
+    if (!keyaDetected && wasKeyaDetected) 
+    {
+        dynamicEncoderTrim = 0.0f;
+        straightLineAccumulator = 0;
+        distanceTraveledStraight = 0.0f;
+        isStraightLine = false;
+        Serial.println("Keya disconnected - Trim reset to zero");
+    }
+    
+    // Update the tracking variable for the NEXT loop iteration
+    wasKeyaDetected = keyaDetected;
 
-// use Keya encoder as simulated ADS1115 WAS
+    // ========================================================
+    // 2. MAIN STEERING LOGIC
+    // ========================================================
+    // use Keya encoder as simulated ADS1115 WAS
     if (keyaDetected && !steerConfig.SingleInputWAS)
     {
-
-
-        float keyaSteerAngleActual;
-        static float keya_GPS_offset = 0;
-        float wasDiff;
-
-        //int16_t keyaPos;
-        int16_t keyaCurrent;
+        // Safely capture the volatile CANBUS position
+        int16_t keyaPos;
         noInterrupts();
-        //keyaPos = keyaSteeringPosition;
-
+        keyaPos = keyaSteeringPosition;
         interrupts();
 
+        // 1. Get continuous motor angle (degrees) using safely captured position
+        float motorDeg = getKeyaContinuousDegrees(keyaPos);
 
+        // ========================================================
+        // STRAIGHT-LINE HYSTERESIS & ACCUMULATOR LOGIC
+        // ========================================================
+        float absYawRate = abs(bnoData.angVel); 
 
-        // 1. Get continuous motor angle (degrees)
-        float motorDeg = getKeyaContinuousDegrees(keyaSteeringPosition);
+        if (!isStraightLine && absYawRate < MAX_STRAIGHT_YAW_ENTRY) 
+        {
+            isStraightLine = true;
+        } 
+        else if (isStraightLine && absYawRate > MAX_STRAIGHT_YAW_EXIT) 
+        {
+            isStraightLine = false;
+            distanceTraveledStraight = 0.0f;  // Reset distance counter on turn
+        }
 
-        // 2. Convert motor → wheel angle to account for steering ratio
-        //float TireDeg = motorDeg / keyaDegreesPerTireDegree;
-        float TireDeg = motorDeg / (steerSettings.steerSensorCounts/10); 
-
-        // 3. Adjust Tiredeg to take into zero offset value from AOG  SteeringAngleActual is tire angle in degrees
-        steerAngleActual = TireDeg + ((float)steerSettings.wasOffset / 100.0f); 
+        if (isStraightLine && gpsSpeed > MIN_SPEED_FOR_TRIM)
+        {
+            // Convert speed (km/h) to m/s, multiply by dt (25ms loop)
+            float metersPerLoop = (gpsSpeed * 0.27778f) * 0.025f;
+            distanceTraveledStraight += metersPerLoop;
             
-        //keyaSteerAngleActual = (float)(steeringPosition) / steerSettings.steerSensorCounts;
-        
-        /////steeringPosition = keyaPos + steerSettings.wasOffset;
-        
+            if (distanceTraveledStraight >= MIN_DISTANCE_FOR_TRIM && straightLineAccumulator < ACCUMULATOR_THRESHOLD)
+            {
+                straightLineAccumulator++;
+            }
+        } 
+        else 
+        {
+            // Faster decay with more aggressive turning
+            int32_t decayRate = 2 + (int32_t)(absYawRate * 0.5f);
+            straightLineAccumulator -= decayRate;
+            if (straightLineAccumulator < 0) straightLineAccumulator = 0;
+            
+            distanceTraveledStraight = 0.0f;
+        }
+
+        // ========================================================
+        // ADAPTIVE TRIM GAIN & SATURATION
+        // ========================================================
+        if (straightLineAccumulator >= ACCUMULATOR_THRESHOLD) 
+        {
+            float encoderDriftError = motorDeg - dynamicEncoderTrim;
+            dynamicEncoderTrim += (encoderDriftError * TRIM_GAIN_HIGH);
+        }
+        else if (straightLineAccumulator > 0)
+        {
+            float encoderDriftError = motorDeg - dynamicEncoderTrim;
+            dynamicEncoderTrim += (encoderDriftError * TRIM_GAIN_LOW);
+        }
+
+        if (dynamicEncoderTrim > MAX_TRIM_LIMIT) dynamicEncoderTrim = MAX_TRIM_LIMIT;
+        if (dynamicEncoderTrim < -MAX_TRIM_LIMIT) dynamicEncoderTrim = -MAX_TRIM_LIMIT;
+
+        // Apply dynamic trim
+        float correctedMotorDeg = motorDeg - dynamicEncoderTrim;
+
+        // 2. Convert corrected motor → wheel angle to account for steering ratio
+        float TireDeg = correctedMotorDeg / (steerSettings.steerSensorCounts / 10.0f);
+
+        // 3. Adjust Tiredeg to take into zero offset value from AOG
+        steerAngleActual = TireDeg + ((float)steerSettings.wasOffset / 100.0f);
+
         // 4. Let existing code handle everything else
         if (steerConfig.InvertWAS)
         {
             steerAngleActual = -steerAngleActual;
         }
-        else
-        {
-            steerAngleActual = steerAngleActual; 
-        }
 
-        //helloSteerPosition = steerAngleActual * steerSettings.steerSensorCounts;
         helloSteerPosition = steerAngleActual;
 
         //Serial.print("Raw CAN: "); Serial.print(keyaPos);
@@ -530,45 +609,8 @@ void autosteerLoop()
         //Serial.print("wasOffset: "); Serial.println(steerSettings.wasOffset);
         //Serial.print("  steerAngleActual: "); Serial.println(steerAngleActual);
 
-
-
     }
 
-
-
-
-    // use Keya encoder
-//    if (keyaDetected && !steerConfig.SingleInputWAS)
-//    {
-//        float keyaSteerAngleActual;
-//        static float keya_GPS_offset = 0;
-//        float wasDiff;
-
-//        steeringPosition = keyaSteeringPosition;
-//        steeringPosition = (steeringPosition + steerSettings.wasOffset);
-//        keyaSteerAngleActual = (float)(steeringPosition) / steerSettings.steerSensorCounts;
-
-//        if (gpsSpeed > 1.2 && !steerConfig.InvertWAS)
-//        {
-//            wasDiff = (keyaSteerAngleActual + keya_GPS_offset) - wheelAngleGPS;
-
-//            keya_GPS_offset -= (wasDiff * (0.001));
-//        }
-
-//        steerAngleActual = keyaSteerAngleActual + keya_GPS_offset;
-//        /*
-//        Serial.print(wasDiff);
-//        Serial.print(",\t");
-//        Serial.print(wheelAngleGPS);
-//        Serial.print(",\t");
-//        Serial.print(keyaSteerAngleActual);
-//        Serial.print(",\t");
-//        Serial.print(keya_GPS_offset);
-//        Serial.print(",\t");
-//        Serial.print(steerAngleActual);
-//        Serial.println(",\t");
-//        */
-//    }
     // use ADS1115
     else
     {
