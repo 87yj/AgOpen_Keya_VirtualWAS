@@ -57,6 +57,11 @@ ADS1115_lite adc(ADS1115_DEFAULT_ADDRESS);     // Use this for the 16-bit versio
 
 #include <IPAddress.h>
 
+// =======timing loop variables for debugging serial print ======
+static uint32_t lastSerialTime = 0;
+const uint32_t SERIAL_INTERVAL = 1000; // 1 second
+// --- Diagnostics Settings ---
+const bool ENABLE_DIAGNOSTICS = true; // Set to false to silence Serial output
 
 // ===== Keya Variables and encoder WAS simulation =====
 extern volatile int16_t keyaSteeringPosition;
@@ -500,6 +505,21 @@ void autosteerLoop()
     switchByte |= workSwitch;
 
 //New code block being worked on....
+
+// --- serial print debugging loop  ---
+    if (ENABLE_DIAGNOSTICS && (millis() - lastSerialTime >= SERIAL_INTERVAL))
+    {
+        lastSerialTime = millis();
+        
+        Serial.print("Trim: ");
+        Serial.print(dynamicEncoderTrim);
+        Serial.print(" | Acc: ");
+        Serial.print(straightLineAccumulator);
+        Serial.print(" | Dist: ");
+        Serial.print(distanceTraveledStraight);
+        Serial.print(" | Straight: ");
+        Serial.println(isStraightLine ? "Yes" : "No");
+    }
 
     // ========================================================
     // 1. KEYA DISCONNECT DETECTION AND TRIM RESET
